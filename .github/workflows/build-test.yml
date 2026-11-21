@@ -1,0 +1,30 @@
+name: build-test
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version to test against
+        type: string
+        default: "20"
+    outputs:
+      artifact-name:
+        description: Name of the uploaded build artifact
+        value: ${{ jobs.build.outputs.artifact-name }}   # ← job output, not step output
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ steps.meta.outputs.name }}
+    steps:
+      - uses: actions/checkout@v5          # checks out the CALLER's repo
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: npm test
+      - id: meta
+        run: echo "name=build-${GITHUB_REPOSITORY#*/}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: package.json
