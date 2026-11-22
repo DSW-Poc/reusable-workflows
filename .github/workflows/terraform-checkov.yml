@@ -1,0 +1,89 @@
+name: terraform-checkov
+
+# Reusable: static security scan of Terraform code with Checkov.
+# Needs no cloud credentials: it reads .tf files only.
+#
+# Caller job must grant:
+#   permissions: { contents: read, security-events: write }
+#   (private repos also need actions: read for the SARIF upload)
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory with the Terraform code to scan
+        type: string
+        default: infra
+      soft-fail:
+        description: Report findings but never fail the job (for rollout / audit mode)
+        type: boolean
+        default: false
+      skip-checks:
+        description: Comma-separated check IDs to skip for this caller (prefer inline checkov:skip with a reason)
+        type: string
+        default: ""
+      upload-sarif:
+        description: Upload results to GitHub code scanning (needs security-events write; not possible on fork PRs)
+        type: boolean
+        default: true
+    outputs:
+      failed-count:
+        description: Number of failed Checkov checks
+        value: ${{ jobs.checkov.outputs.failed-count }}
+
+jobs:
+  checkov:
+    name: checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      failed-count: ${{ steps.summary.outputs.failed-count }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkov scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.working-directory }}
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,results.sarif
+          # Empty, not "false": the action's entrypoint picks its annotation matcher with `-z`,
+          # so any non-empty value would downgrade inline PR annotations from errors to warnings.
+          soft_fail: ${{ inputs.soft-fail && 'true' || '' }}
+          skip_check: ${{ inputs.skip-checks }}
+          quiet: true
+
+      # Runs even when the scan failed: the findings are most useful exactly then.
+      - name: Findings summary
+        id: summary
+        if: success() || failure()
+        run: |
+          if [ ! -f results.sarif ]; then
+            echo "failed-count=-1" >> "$GITHUB_OUTPUT"
+            echo "### Checkov: no SARIF produced (scan error?)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          count=$(jq '[.runs[].results[]] | length' results.sarif)
+          echo "failed-count=$count" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Checkov: ${count} failed check(s) in \`${{ inputs.working-directory }}\`"
+            if [ "$count" -gt 0 ]; then
+              echo ""
+              echo "| Check | Finding | File:line |"
+              echo "|---|---|---|"
+              jq -r '.runs[].results[] | "| `\(.ruleId)` | \(.message.text) | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` |"' results.sarif
+              echo ""
+              echo "Fix the code, or suppress with a reason on the resource: \`# checkov:skip=CHECK_ID:why\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to code scanning
+        if: (success() || failure()) && inputs.upload-sarif && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+          category: checkov-${{ inputs.working-directory }}
