@@ -1,0 +1,48 @@
+# Reusable workflow: assume an AWS role via OIDC inside a GitHub environment.
+# This is the skeleton every deploy workflow (Terraform, EKS) builds on.
+#
+# The CALLER job must grant:   permissions: { id-token: write, contents: read }
+# (a reusable workflow can only keep or reduce the caller's permissions, never add to them)
+name: aws-identity
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment in the CALLER repo (also becomes part of the OIDC sub claim)
+        type: string
+        required: true
+      role-arn:
+        description: IAM role to assume via OIDC
+        type: string
+        required: true
+      aws-region:
+        description: AWS region
+        type: string
+        required: true
+    outputs:
+      account-id:
+        description: AWS account the role lives in
+        value: ${{ jobs.whoami.outputs.account-id }}
+
+jobs:
+  whoami:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # environment goes HERE, never on the caller job
+    permissions:
+      id-token: write                        # needs the caller to grant this; can't be raised here
+      contents: read
+    outputs:
+      account-id: ${{ steps.identity.outputs.account }}
+    steps:
+      - name: Assume ${{ inputs.role-arn }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Who am I?
+        id: identity
+        run: |
+          aws sts get-caller-identity
+          echo "account=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
