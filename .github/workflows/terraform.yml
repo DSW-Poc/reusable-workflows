@@ -1,0 +1,153 @@
+# Reusable workflow: Terraform plan -> (approval) -> apply the SAME plan.
+#
+#   plan   job: no environment -> OIDC sub ...:ref:refs/heads/main -> read-only plan role
+#   apply  job: environment     -> OIDC sub ...:environment:<env>  -> write apply role
+#               waits for the environment's required reviewers BEFORE it gets a runner.
+#
+# The CALLER job must grant:  permissions: { id-token: write, contents: read }
+# Recommended on the caller job:  concurrency: { group: terraform-<env>, cancel-in-progress: false }
+name: terraform
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment (in the caller repo) that gates the apply job
+        type: string
+        required: true
+      working-directory:
+        description: Directory containing the Terraform root module
+        type: string
+        default: infra
+      aws-region:
+        type: string
+        required: true
+      plan-role-arn:
+        description: Read-only role, trusted for the branch sub (no environment)
+        type: string
+        required: true
+      apply-role-arn:
+        description: Write role, trusted only for the environment sub
+        type: string
+        required: true
+      state-bucket:
+        type: string
+        required: true
+      state-key:
+        type: string
+        required: true
+      terraform-version:
+        description: Pinned so plan and apply use the identical binary
+        type: string
+        default: "1.17.2"
+    outputs:
+      has-changes:
+        description: "'true' if the plan contained changes"
+        value: ${{ jobs.plan.outputs.has-changes }}
+
+# env defined INSIDE the reusable workflow is fine; it's the caller's env that doesn't pass through.
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      has-changes: ${{ steps.plan.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assume plan role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.plan-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false   # we need Terraform's real exit code
+
+      - name: terraform init
+        run: >
+          terraform init
+          -backend-config="bucket=${{ inputs.state-bucket }}"
+          -backend-config="key=${{ inputs.state-key }}"
+          -backend-config="region=${{ inputs.aws-region }}"
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+          # 0 = no changes, 1 = error, 2 = changes present
+          if [ "$code" -eq 1 ]; then exit 1; fi
+          if [ "$code" -eq 2 ]; then echo "has-changes=true" >> "$GITHUB_OUTPUT"; else echo "has-changes=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Plan summary (what the reviewer approves)
+        run: |
+          {
+            echo "### Terraform plan · ${{ inputs.environment }} · changes: ${{ steps.plan.outputs.has-changes }}"
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan file
+        if: steps.plan.outputs.has-changes == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}/tfplan   # upload paths ignore defaults.run
+          retention-days: 1                            # plan files hold values in cleartext
+          if-no-files-found: error
+
+  apply:
+    needs: plan
+    if: needs.plan.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # <- the approval gate
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v5            # same run => same commit as the plan job
+
+      - name: Assume apply role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.apply-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: terraform init (identical working directory)
+        run: >
+          terraform init
+          -backend-config="bucket=${{ inputs.state-bucket }}"
+          -backend-config="key=${{ inputs.state-key }}"
+          -backend-config="region=${{ inputs.aws-region }}"
+
+      - name: Download the approved plan
+        uses: actions/download-artifact@v8
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}
+
+      - name: terraform apply (exactly the reviewed plan)
+        run: terraform apply tfplan

@@ -5,6 +5,7 @@ Central, versioned reusable GitHub Actions workflows for DSW-Poc.
 | Workflow | Purpose |
 |---|---|
 | `build-test.yml` | Set up Node, run `npm test`, upload an artifact, output its name |
+| `terraform.yml` | Plan with a read-only role, wait for environment approval, apply the same plan with a write role |
 | `aws-identity.yml` | Assume an AWS role via OIDC in a caller environment; output the account ID |
 
 ## Usage
@@ -34,4 +35,20 @@ The caller job must grant `id-token: write`:
       environment: dev
       role-arn: ${{ vars.AWS_ROLE_ARN_DEV }}
       aws-region: ${{ vars.AWS_REGION }}
+```
+
+### Terraform (plan -> approval -> apply)
+
+```yaml
+  prod:
+    concurrency: { group: terraform-prod, cancel-in-progress: false }
+    permissions: { id-token: write, contents: read }
+    uses: DSW-Poc/reusable-workflows/.github/workflows/terraform.yml@v1
+    with:
+      environment: prod
+      aws-region: ${{ vars.AWS_REGION }}
+      plan-role-arn: ${{ vars.AWS_ROLE_ARN_PROD_PLAN }}
+      apply-role-arn: ${{ vars.AWS_ROLE_ARN_PROD_APPLY }}
+      state-bucket: ${{ vars.TF_STATE_BUCKET }}
+      state-key: demo-app/prod/terraform.tfstate
 ```
